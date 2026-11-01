@@ -1,12 +1,16 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, Menu, nativeImage, Tray } from 'electron';
 import path from 'node:path';
-import { classifyCommand, helpText } from '../core/router';
-import { launchApp, openFolder } from './windows';
-import type { CommandResult } from '../shared/types';
+import { COMMAND_PROTOCOL_VERSION } from '../shared/types';
+import { executeCommand } from './command';
+import { WhisperService } from './voice';
+import { WindowsSpeechService } from './speech';
 
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+// Resolve Whisper lazily inside the service so development restarts and fresh environment values are not captured at module load.
+const whisper = new WhisperService({ speechEnabled: true });
+const speech = new WindowsSpeechService();
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
 function createWindow() {
@@ -14,6 +18,7 @@ function createWindow() {
     backgroundColor: '#07111f', webPreferences: { preload: path.join(__dirname, '../preload/preload.js'), contextIsolation: true, sandbox: true, nodeIntegration: false } });
   window.once('ready-to-show', () => window?.show());
   window.on('close', (event) => { if (!isQuitting) { event.preventDefault(); window?.hide(); } });
+  window.on('hide', () => window?.webContents.send('voice:cancel-recording'));
   if (isDev) void window.loadURL(process.env.VITE_DEV_SERVER_URL!);
   else void window.loadFile(path.join(__dirname, '../renderer/index.html'));
 }
@@ -28,24 +33,31 @@ function createTray() {
   tray.on('double-click', () => { window?.show(); window?.focus(); });
 }
 
-async function handleCommand(input: string): Promise<CommandResult> {
-  const intent = classifyCommand(input);
-  try {
-    if (intent.kind === 'help') return { ok: true, message: helpText(), intent };
-    if (intent.kind === 'time') return { ok: true, message: `It is ${new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(new Date())}.`, intent };
-    if (intent.kind === 'launch-app' && intent.app) { await launchApp(intent.app); return { ok: true, message: `Opening ${intent.app === 'vscode' ? 'VS Code' : intent.app}.`, intent }; }
-    if (intent.kind === 'open-folder' && intent.path) { await openFolder(intent.path); return { ok: true, message: `Opening ${intent.path}.`, intent }; }
-    return { ok: false, message: 'I do not recognize that command yet. Type “help” to see what I can do.', intent };
-  } catch (error) { return { ok: false, message: error instanceof Error ? error.message : 'The operation failed.', intent }; }
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => { window?.show(); window?.focus(); });
+  app.whenReady().then(() => {
+    createWindow(); createTray();
+    ipcMain.handle('command:execute', (_event, input: unknown) => typeof input === 'string' ? executeCommand(input) : Promise.resolve({ ok: false, message: 'Invalid command.', intent: { kind: 'unknown', displayText: '', normalizedText: '' } }));
+    ipcMain.handle('window:toggle', () => { if (window?.isVisible()) window.hide(); else { window?.show(); window?.focus(); } });
+    ipcMain.handle('system:info', () => ({ platform: process.platform, version: app.getVersion(), commandProtocol: COMMAND_PROTOCOL_VERSION }));
+    ipcMain.handle('voice:availability', async () => ({ ...await whisper.availability(), speechAvailable: await speech.available() }));
+    ipcMain.handle('voice:transcribe', async (_event, audio: unknown) => {
+      if (!(audio instanceof ArrayBuffer) && !ArrayBuffer.isView(audio)) throw new Error('Invalid voice recording.');
+      const bytes = audio instanceof ArrayBuffer ? new Uint8Array(audio) : new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
+      return { text: await whisper.transcribeWav(bytes) };
+    });
+    ipcMain.handle('voice:speak', (_event, text: unknown, voiceName: unknown) => {
+      if (typeof text !== 'string') throw new Error('Invalid speech text.');
+      return speech.speak(text, typeof voiceName === 'string' ? voiceName : undefined);
+    });
+    ipcMain.handle('voice:stop-speaking', () => speech.stop());
+    if (!globalShortcut.register('CommandOrControl+Shift+J', () => { if (window?.isVisible()) window.hide(); else { window?.show(); window?.focus(); } })) console.warn('Global shortcut Ctrl+Shift+J is unavailable.');
+  });
 }
 
-app.whenReady().then(() => {
-  createWindow(); createTray();
-  ipcMain.handle('command:execute', (_event, input: unknown) => typeof input === 'string' ? handleCommand(input) : Promise.resolve({ ok: false, message: 'Invalid command.', intent: { kind: 'unknown', displayText: '' } }));
-  ipcMain.handle('window:toggle', () => { if (window?.isVisible()) window.hide(); else { window?.show(); window?.focus(); } });
-  ipcMain.handle('system:info', () => ({ platform: process.platform, version: app.getVersion() }));
-  if (!globalShortcut.register('CommandOrControl+Shift+J', () => { if (window?.isVisible()) window.hide(); else { window?.show(); window?.focus(); } })) console.warn('Global shortcut Ctrl+Shift+J is unavailable.');
-});
-
 app.on('will-quit', () => { globalShortcut.unregisterAll(); tray?.destroy(); });
+app.on('will-quit', () => { window?.webContents.send('voice:cancel-recording'); speech.stop(); });
 app.on('window-all-closed', () => { /* tray app intentionally stays alive */ });
